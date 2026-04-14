@@ -191,22 +191,44 @@ def render_loop(job_id: str, input_path: Path, duration_hours: float, title_hint
             str(unit_wav)
         ], check=True, capture_output=True)
 
-        # Step 3: stream_loop the unit to target duration, then crossfade-wrap itself
+        # Step 3: stream_loop the unit to target duration
         update(status=f"Extending to {duration_hours}h", progress=40)
         target_sec = int(duration_hours * 3600)
-
-        # Calculate how many times to concatenate unit to reach target
-        reps_needed = max(1, int(target_sec / unit_dur) + 2)
         looped_wav = work_dir / "looped.wav"
 
-        subprocess.run([
+        # Probe actual unit duration (don't trust computed value)
+        probe2 = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(unit_wav)],
+            capture_output=True, text=True, check=True
+        )
+        actual_unit_dur = float(probe2.stdout.strip())
+        print(f"[render] job={job_id} unit_dur computed={unit_dur:.2f}s actual={actual_unit_dur:.2f}s target={target_sec}s", flush=True)
+
+        # Use infinite stream_loop (-1) so -t is the only thing that limits length.
+        # This avoids premature truncation when reps_needed math is off.
+        loop_cmd = [
             "ffmpeg", "-y",
-            "-stream_loop", str(reps_needed - 1),
+            "-stream_loop", "-1",
             "-i", str(unit_wav),
             "-t", str(target_sec),
             "-c:a", "pcm_s16le",
             str(looped_wav)
-        ], check=True, capture_output=True)
+        ]
+        result = subprocess.run(loop_cmd, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"stream_loop failed: {result.stderr.decode()[-500:]}")
+
+        # Verify the looped output actually reached target
+        probe3 = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(looped_wav)],
+            capture_output=True, text=True, check=True
+        )
+        looped_dur = float(probe3.stdout.strip())
+        print(f"[render] job={job_id} looped_dur={looped_dur:.1f}s (expected {target_sec}s)", flush=True)
+        if looped_dur < target_sec * 0.95:
+            raise RuntimeError(f"looped output is only {looped_dur:.0f}s, expected {target_sec}s. Source audio may be too short.")
 
         # Step 4: loudnorm + fade in/out, encode MP3
         update(status="Mastering & encoding MP3", progress=75)
