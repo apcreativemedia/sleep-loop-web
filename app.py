@@ -223,54 +223,41 @@ def render_loop(job_id: str, input_path: Path, duration_hours: float, title_hint
             str(unit_wav)
         ], check=True, capture_output=True)
 
-        # Step 3: stream_loop the unit to target duration
-        update(status=f"Extending to {duration_hours}h", progress=40)
+        # Step 3: ONE-SHOT: stream_loop + loudnorm + fade + MP3 encode
+        # No intermediate 600 MB WAV. ffmpeg streams everything through.
+        update(status=f"Rendering {duration_hours}h MP3", progress=40)
         target_sec = int(duration_hours * 3600)
-        looped_wav = work_dir / "looped.wav"
+        fade_out_start = target_sec - 10
+        out_mp3 = work_dir / "output.mp3"
 
-        # Probe actual unit duration (don't trust computed value)
         actual_unit_dur = probe_duration(unit_wav)
-        print(f"[render] job={job_id} unit_dur computed={unit_dur:.2f}s actual={actual_unit_dur:.2f}s target={target_sec}s", flush=True)
+        print(f"[render] job={job_id} unit_dur={actual_unit_dur:.1f}s target={target_sec}s", flush=True)
 
-        # Use infinite stream_loop (-1) so -t is the only thing that limits length.
-        # This avoids premature truncation when reps_needed math is off.
-        loop_cmd = [
+        render_cmd = [
             "ffmpeg", "-y",
             "-stream_loop", "-1",
             "-i", str(unit_wav),
             "-t", str(target_sec),
-            "-c:a", "pcm_s16le",
-            str(looped_wav)
-        ]
-        result = subprocess.run(loop_cmd, capture_output=True)
-        if result.returncode != 0:
-            raise RuntimeError(f"stream_loop failed: {result.stderr.decode()[-500:]}")
-
-        # Verify the looped output actually reached target
-        looped_dur = probe_duration(looped_wav)
-        print(f"[render] job={job_id} looped_dur={looped_dur:.1f}s (expected {target_sec}s)", flush=True)
-        if looped_dur < target_sec * 0.95:
-            raise RuntimeError(f"looped output is only {looped_dur:.0f}s, expected {target_sec}s. Source audio may be too short.")
-
-        # Step 4: loudnorm + fade in/out, encode MP3
-        update(status="Mastering & encoding MP3", progress=75)
-        out_mp3 = work_dir / "output.mp3"
-        fade_out_start = target_sec - 10
-
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(looped_wav),
             "-af", f"loudnorm=I=-18:TP=-1.5:LRA=11,afade=t=in:st=0:d=5,afade=t=out:st={fade_out_start}:d=10",
             "-c:a", "libmp3lame", "-b:a", "192k",
             "-ac", "2", "-ar", "44100",
             "-metadata", f"title={title_hint or 'Sleep Loop'} {duration_hours}h",
             "-metadata", "artist=Sleep Loop Web",
             str(out_mp3)
-        ], check=True, capture_output=True)
+        ]
+        result = subprocess.run(render_cmd, capture_output=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"render failed: {result.stderr.decode()[-600:]}")
+
+        # Verify output reached target
+        out_dur = probe_duration(out_mp3)
+        print(f"[render] job={job_id} output_dur={out_dur:.1f}s", flush=True)
+        if out_dur < target_sec * 0.95:
+            raise RuntimeError(f"output is only {out_dur:.0f}s, expected {target_sec}s")
 
         # Cleanup intermediate WAVs to save disk
         clean_wav.unlink(missing_ok=True)
         unit_wav.unlink(missing_ok=True)
-        looped_wav.unlink(missing_ok=True)
 
         update(status="Done", progress=100, output=str(out_mp3))
 
