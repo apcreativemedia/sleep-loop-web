@@ -152,23 +152,55 @@ def render_loop(job_id: str, input_path: Path, duration_hours: float, title_hint
     try:
         update(status="Cleaning source", progress=5)
 
-        # Step 1: get source duration
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
-            capture_output=True, text=True, check=True
-        )
-        src_dur = float(probe.stdout.strip())
+        # Step 1: decode source to normalized WAV FIRST, then measure from WAV.
+        # This handles any input format and formats missing duration metadata.
+        raw_wav = work_dir / "raw.wav"
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-ac", "2", "-ar", "44100",
+            "-c:a", "pcm_s16le",
+            str(raw_wav)
+        ], check=True, capture_output=True)
+
+        # Measure from the decoded WAV (reliable)
+        def probe_duration(path: Path) -> float:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error",
+                 "-select_streams", "a:0",
+                 "-show_entries", "stream=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                capture_output=True, text=True, check=True
+            )
+            s = r.stdout.strip()
+            if not s or s == "N/A":
+                # Fallback: count samples
+                r2 = subprocess.run(
+                    ["ffprobe", "-v", "error",
+                     "-select_streams", "a:0",
+                     "-count_frames", "-show_entries", "stream=duration_ts,sample_rate",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+                    capture_output=True, text=True, check=True
+                )
+                lines = dict(ln.split("=") for ln in r2.stdout.strip().splitlines() if "=" in ln)
+                return float(lines.get("duration_ts", 0)) / float(lines.get("sample_rate", 44100))
+            return float(s)
+
+        src_dur = probe_duration(raw_wav)
+        print(f"[render] job={job_id} src_dur={src_dur:.2f}s", flush=True)
+        if src_dur < 20:
+            raise RuntimeError(f"Audio demasiado corto ({src_dur:.1f}s). Necesita al menos 20 segundos para hacer un loop sin costuras.")
+
         trim_end = max(src_dur - 0.5, min(src_dur, 5.0))
         clean_wav = work_dir / "clean.wav"
 
         subprocess.run([
-            "ffmpeg", "-y", "-i", str(input_path),
+            "ffmpeg", "-y", "-i", str(raw_wav),
             "-af", f"atrim=start=0.5:end={trim_end},asetpts=PTS-STARTPTS",
             "-ac", "2", "-ar", "44100",
             str(clean_wav)
         ], check=True, capture_output=True)
 
+        raw_wav.unlink(missing_ok=True)  # free disk
         clean_dur = trim_end - 0.5  # seconds
 
         # Step 2: build seamless loop unit (chain 8 copies with qsin 8s crossfade)
@@ -197,12 +229,7 @@ def render_loop(job_id: str, input_path: Path, duration_hours: float, title_hint
         looped_wav = work_dir / "looped.wav"
 
         # Probe actual unit duration (don't trust computed value)
-        probe2 = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(unit_wav)],
-            capture_output=True, text=True, check=True
-        )
-        actual_unit_dur = float(probe2.stdout.strip())
+        actual_unit_dur = probe_duration(unit_wav)
         print(f"[render] job={job_id} unit_dur computed={unit_dur:.2f}s actual={actual_unit_dur:.2f}s target={target_sec}s", flush=True)
 
         # Use infinite stream_loop (-1) so -t is the only thing that limits length.
@@ -220,12 +247,7 @@ def render_loop(job_id: str, input_path: Path, duration_hours: float, title_hint
             raise RuntimeError(f"stream_loop failed: {result.stderr.decode()[-500:]}")
 
         # Verify the looped output actually reached target
-        probe3 = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(looped_wav)],
-            capture_output=True, text=True, check=True
-        )
-        looped_dur = float(probe3.stdout.strip())
+        looped_dur = probe_duration(looped_wav)
         print(f"[render] job={job_id} looped_dur={looped_dur:.1f}s (expected {target_sec}s)", flush=True)
         if looped_dur < target_sec * 0.95:
             raise RuntimeError(f"looped output is only {looped_dur:.0f}s, expected {target_sec}s. Source audio may be too short.")
