@@ -1,0 +1,4 @@
+Flask==3.0.3
+pytrends==4.9.2
+yt-dlp==2024.8.6
+gunicorn==22.0.0

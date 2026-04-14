@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sleep Loop Web</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --card: #131a33;
+      --fg: #e8ecf4;
+      --muted: #8892b0;
+      --accent: #7aa2ff;
+      --accent2: #4cc9a0;
+      --border: #223055;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(ellipse at top, #1a2550, #0b1020 60%);
+      color: var(--fg);
+      min-height: 100vh;
+      padding: 2rem 1rem 4rem;
+    }
+    .wrap { max-width: 760px; margin: 0 auto; }
+    h1 { font-size: 2rem; margin: 0 0 .25rem; }
+    .sub { color: var(--muted); margin: 0 0 2rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+    h2 { font-size: 1.15rem; margin: 0 0 1rem; }
+    .trending-list { display: flex; flex-direction: column; gap: .5rem; }
+    .trend-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: .7rem .9rem;
+      background: #0d1430;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      gap: .75rem;
+    }
+    .trend-item a {
+      color: var(--accent);
+      text-decoration: none;
+      font-size: .95rem;
+      word-break: break-word;
+    }
+    .source-tag {
+      font-size: .7rem;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: var(--border);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    form label { display: block; margin-bottom: .5rem; color: var(--muted); font-size: .9rem; }
+    input[type=file], input[type=text] {
+      width: 100%;
+      padding: .7rem;
+      background: #0d1430;
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      margin-bottom: 1rem;
+    }
+    .radio-row { display: flex; gap: 1rem; margin-bottom: 1.25rem; }
+    .radio-pill {
+      flex: 1;
+      padding: .9rem;
+      background: #0d1430;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      text-align: center;
+      cursor: pointer;
+      transition: .15s;
+    }
+    .radio-pill input { display: none; }
+    .radio-pill:has(input:checked) {
+      border-color: var(--accent);
+      background: rgba(122,162,255,0.1);
+    }
+    button {
+      width: 100%;
+      padding: .9rem;
+      background: var(--accent);
+      color: #0b1020;
+      border: 0;
+      border-radius: 10px;
+      font-weight: 700;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .progress-wrap { display: none; margin-top: 1rem; }
+    .progress-wrap.visible { display: block; }
+    .bar-outer { height: 8px; background: #0d1430; border-radius: 4px; overflow: hidden; }
+    .bar-inner { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); width: 0; transition: width .5s; }
+    .status-text { color: var(--muted); font-size: .9rem; margin-top: .5rem; }
+    .download-btn {
+      display: block;
+      margin-top: 1rem;
+      background: var(--accent2);
+      text-align: center;
+      padding: .9rem;
+      color: #0b1020;
+      border-radius: 10px;
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .error-msg {
+      color: #ff7a7a;
+      background: rgba(255,122,122,0.1);
+      border: 1px solid rgba(255,122,122,0.3);
+      padding: .7rem;
+      border-radius: 8px;
+      margin-top: 1rem;
+      font-size: .85rem;
+    }
+    .loading { color: var(--muted); font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🌙 Sleep Loop</h1>
+    <p class="sub">Convierte cualquier audio en un loop perfecto de 1h u 8h.</p>
+
+    <div class="card">
+      <h2>🔥 Lo más buscado hoy</h2>
+      <div id="trending" class="trending-list">
+        <div class="loading">Cargando tendencias…</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🎵 Subir audio y convertir a loop</h2>
+      <form id="form">
+        <label>Archivo de audio (mp3, wav, m4a, mp4…)</label>
+        <input type="file" name="audio" accept="audio/*,video/mp4" required>
+
+        <label>Nombre (opcional)</label>
+        <input type="text" name="title" placeholder="gentle stream, rain on tent, etc.">
+
+        <label>Duración del loop final</label>
+        <div class="radio-row">
+          <label class="radio-pill">
+            <input type="radio" name="duration" value="1" checked>
+            <strong>1 hora</strong><br><small style="color:var(--muted)">~15 MB</small>
+          </label>
+          <label class="radio-pill">
+            <input type="radio" name="duration" value="8">
+            <strong>8 horas</strong><br><small style="color:var(--muted)">~120 MB</small>
+          </label>
+        </div>
+
+        <button type="submit" id="submitBtn">Generar loop</button>
+
+        <div id="progressWrap" class="progress-wrap">
+          <div class="bar-outer"><div class="bar-inner" id="barInner"></div></div>
+          <div class="status-text" id="statusText">Iniciando…</div>
+          <div id="downloadArea"></div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+<script>
+async function loadTrending() {
+  try {
+    const r = await fetch("/api/trending");
+    const data = await r.json();
+    const el = document.getElementById("trending");
+    if (!data.length) { el.innerHTML = '<div class="loading">Sin tendencias disponibles</div>'; return; }
+    el.innerHTML = data.map(item => `
+      <div class="trend-item">
+        <a href="${item.url}" target="_blank" rel="noopener">${escapeHtml(item.topic)}</a>
+        <span class="source-tag">${escapeHtml(item.source)}</span>
+      </div>
+    `).join("");
+  } catch (e) {
+    document.getElementById("trending").innerHTML = '<div class="loading">Error cargando tendencias</div>';
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.getElementById("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const btn = document.getElementById("submitBtn");
+  const wrap = document.getElementById("progressWrap");
+  const bar = document.getElementById("barInner");
+  const statusText = document.getElementById("statusText");
+  const dl = document.getElementById("downloadArea");
+
+  btn.disabled = true;
+  wrap.classList.add("visible");
+  dl.innerHTML = "";
+  bar.style.width = "0%";
+  statusText.textContent = "Subiendo…";
+
+  const fd = new FormData(form);
+  try {
+    const r = await fetch("/api/render", { method: "POST", body: fd });
+    const data = await r.json();
+    if (data.error) {
+      statusText.innerHTML = `<span style="color:#ff7a7a">${escapeHtml(data.error)}</span>`;
+      btn.disabled = false;
+      return;
+    }
+    pollStatus(data.job_id);
+  } catch (err) {
+    statusText.textContent = "Error: " + err.message;
+    btn.disabled = false;
+  }
+});
+
+async function pollStatus(jobId) {
+  const bar = document.getElementById("barInner");
+  const statusText = document.getElementById("statusText");
+  const dl = document.getElementById("downloadArea");
+  const btn = document.getElementById("submitBtn");
+
+  const tick = async () => {
+    try {
+      const r = await fetch(`/api/status/${jobId}`);
+      const data = await r.json();
+      bar.style.width = (data.progress || 0) + "%";
+      statusText.textContent = data.status + " — " + (data.progress || 0) + "%";
+
+      if (data.error) {
+        statusText.innerHTML = `<div class="error-msg">${escapeHtml(data.error)}</div>`;
+        btn.disabled = false;
+        return;
+      }
+      if (data.done) {
+        statusText.textContent = "¡Listo! 🎉";
+        dl.innerHTML = `<a class="download-btn" href="/download/${jobId}">⬇ Descargar MP3</a>`;
+        btn.disabled = false;
+        return;
+      }
+      setTimeout(tick, 2000);
+    } catch (e) {
+      statusText.textContent = "Error polling: " + e.message;
+      btn.disabled = false;
+    }
+  };
+  tick();
+}
+
+loadTrending();
+</script>
+</body>
+</html>
