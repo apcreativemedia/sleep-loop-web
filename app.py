@@ -1,5 +1,14 @@
 """
 Sleep Loop Web - Flask app
+Features:
+  - Trending sleep sounds (Google Trends + YouTube)
+  - Upload 1 or many audios
+  - Separate mode: each audio -> its own loop
+  - Mix mode: all audios mixed into one loop (rain + thunder + wind)
+  - Custom duration in minutes (10 to 720)
+  - Seamless render: adaptive unit copies, qsin 8s internal crossfades, 20s wrap seal
+  - Auto loop-point detection (RMS + waveform + spectral centroid)
+  - Cuts report (.txt) with INTERNAL + WRAP timestamps
 """
 import os
 import uuid
@@ -18,15 +27,26 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 RENDER_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 1000 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 1000 * 1024 * 1024  # 1 GB
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-INTERNAL_XFADE = 8.0
-WRAP_XFADE = 20.0
-UNIT_COPIES = 16
+# Render constants
+INTERNAL_XFADE = 8.0      # inside the unit (do NOT change — user-approved)
+WRAP_XFADE = 20.0         # wrap-around seal between units
+TARGET_UNIT_DUR = 600.0   # aim unit >= 10 min so wraps are rare
+MAX_UNIT_COPIES = 16
+MIN_UNIT_COPIES = 4
 
+def choose_unit_copies(clean_dur: float) -> int:
+    import math
+    n = int(math.ceil(TARGET_UNIT_DUR / max(clean_dur, 1.0)))
+    return max(MIN_UNIT_COPIES, min(MAX_UNIT_COPIES, n))
+
+# -----------------------------------------------------------------------------
+# Trending: Google Trends + YouTube search
+# -----------------------------------------------------------------------------
 TRENDING_CACHE = {"date": None, "items": []}
 
 FALLBACK_TOPICS = [
@@ -109,6 +129,9 @@ def get_trending():
     return items
 
 
+# -----------------------------------------------------------------------------
+# Audio helpers
+# -----------------------------------------------------------------------------
 def probe_duration(path: Path) -> float:
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -186,6 +209,9 @@ def fmt_t(sec):
     return f"{m}:{s:05.2f}"
 
 
+# -----------------------------------------------------------------------------
+# Core render pipeline
+# -----------------------------------------------------------------------------
 def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mix_mode: bool):
     def update(status=None, progress=None, error=None, output=None):
         with JOBS_LOCK:
@@ -229,7 +255,8 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         default_end = max(src_dur - 0.5, min(src_dur, 5.0))
         try:
             best_end, score = find_best_loop_point(
-                raw_wav, window_sec=2.0,
+                raw_wav,
+                window_sec=2.0,
                 search_back_sec=min(6.0, max(2.0, src_dur / 3))
             )
             if score > 0.3 and best_end > 20.0 and best_end <= src_dur - 0.05:
@@ -251,24 +278,37 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         raw_wav.unlink(missing_ok=True)
         clean_dur = trim_end - 0.5
 
-        update(status=f"Building unit ({UNIT_COPIES} copies)", progress=20)
-        unit_dur = UNIT_COPIES * clean_dur - (UNIT_COPIES - 1) * INTERNAL_XFADE
+        # Step 3: build adaptive-copy unit with INTERNAL qsin 8s crossfades
+        unit_copies = choose_unit_copies(clean_dur)
+        print(f"[render] job={job_id} chose unit_copies={unit_copies} for clean_dur={clean_dur:.1f}s", flush=True)
+        update(status=f"Building unit ({unit_copies} copies)", progress=20)
         unit_wav = work_dir / "unit.wav"
-        fc = f"[0]asplit={UNIT_COPIES}" + "".join(f"[a{i}]" for i in range(1, UNIT_COPIES + 1)) + ";"
-        fc += f"[a1][a2]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[x1];"
-        for i in range(3, UNIT_COPIES):
-            fc += f"[x{i-2}][a{i}]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[x{i-1}];"
-        fc += f"[x{UNIT_COPIES-2}][a{UNIT_COPIES}]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[loop]"
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(clean_wav),
-            "-filter_complex", fc, "-map", "[loop]",
-            "-c:a", "pcm_s16le", str(unit_wav)
-        ], check=True, capture_output=True)
+        if unit_copies == 1:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(clean_wav),
+                "-c:a", "pcm_s16le", str(unit_wav)
+            ], check=True, capture_output=True)
+            fc = None
+        else:
+            fc = f"[0]asplit={unit_copies}" + "".join(f"[a{i}]" for i in range(1, unit_copies + 1)) + ";"
+            if unit_copies == 2:
+                fc += f"[a1][a2]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[loop]"
+            else:
+                fc += f"[a1][a2]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[x1];"
+                for i in range(3, unit_copies):
+                    fc += f"[x{i-2}][a{i}]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[x{i-1}];"
+                fc += f"[x{unit_copies-2}][a{unit_copies}]acrossfade=d={INTERNAL_XFADE}:c1=qsin:c2=qsin[loop]"
+        if fc is not None:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(clean_wav),
+                "-filter_complex", fc, "-map", "[loop]",
+                "-c:a", "pcm_s16le", str(unit_wav)
+            ], check=True, capture_output=True)
         clean_wav.unlink(missing_ok=True)
         actual_unit_dur = probe_duration(unit_wav)
         print(f"[render] unit_dur={actual_unit_dur:.2f}s", flush=True)
 
-        # TRUE seamless wrap-around seal via acrossfade
+        # Step 4: wrap-around seal
         update(status="Sealing wrap (20s crossfade)", progress=35)
         sealed_wav = work_dir / "sealed.wav"
         seal_fc = (
@@ -286,6 +326,7 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         sealed_dur = probe_duration(sealed_wav)
         print(f"[render] sealed_dur={sealed_dur:.2f}s", flush=True)
 
+        # Step 5: stream_loop + loudnorm + fades + MP3
         update(status=f"Rendering {duration_min} min MP3", progress=50)
         fade_out_start = target_sec - 10
         out_mp3 = work_dir / "output.mp3"
@@ -309,11 +350,11 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         if out_dur < target_sec * 0.95:
             raise RuntimeError(f"output is only {out_dur:.0f}s, expected {target_sec}s")
 
+        # Step 6: cuts report
         internal_cuts_in_unit = []
-        for k in range(1, UNIT_COPIES):
+        for k in range(1, unit_copies):
             t = k * (clean_dur - INTERNAL_XFADE) + (k - 1) * INTERNAL_XFADE
             internal_cuts_in_unit.append(t + INTERNAL_XFADE / 2)
-
         sealed_internals = [c - WRAP_XFADE for c in internal_cuts_in_unit if c - WRAP_XFADE > 0]
         wrap_midpoint = sealed_dur - WRAP_XFADE / 2
 
@@ -335,7 +376,7 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
             f"Sleep Loop - cut report",
             f"Source duration: {src_dur:.2f}s ({fmt_t(src_dur)})",
             f"Clean duration: {clean_dur:.2f}s",
-            f"Unit copies: {UNIT_COPIES}",
+            f"Unit copies: {unit_copies}",
             f"Unit duration (before seal): {actual_unit_dur:.2f}s ({fmt_t(actual_unit_dur)})",
             f"Sealed unit duration: {sealed_dur:.2f}s ({fmt_t(sealed_dur)})",
             f"INTERNAL crossfade: qsin {INTERNAL_XFADE}s",
@@ -370,6 +411,9 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         update(status="Failed", error=str(e))
 
 
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @app.route("/")
 def index():
     return render_template("index.html")
