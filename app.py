@@ -1,5 +1,5 @@
 """
-Sleep Loop Web - Flask app
+Sleep Loop Web - Flask app with auto-loop-point detection
 """
 import os
 import uuid
@@ -107,6 +107,59 @@ def get_trending():
     return items
 
 
+def find_best_loop_point(wav_path, window_sec=2.0, search_back_sec=5.0):
+    """Find the best end-trim point where end naturally matches start."""
+    import numpy as np
+    from scipy.io import wavfile
+    from scipy.signal import stft
+
+    sr, audio = wavfile.read(str(wav_path))
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    audio = audio.astype(np.float32) / 32768.0
+    total = len(audio)
+    window = int(window_sec * sr)
+
+    ref = audio[:window]
+    ref_rms = float(np.sqrt(np.mean(ref * ref) + 1e-12))
+
+    def centroid(x):
+        f, t, Z = stft(x, fs=sr, nperseg=1024)
+        mag = np.abs(Z).mean(axis=1)
+        if mag.sum() < 1e-9:
+            return 0.0
+        return float((f * mag).sum() / mag.sum())
+
+    ref_cent = centroid(ref)
+    search_back_samples = int(search_back_sec * sr)
+    search_start = max(window + int(0.5 * sr), total - search_back_samples)
+    search_end = total
+    step = max(1, int(0.05 * sr))
+
+    best_score = -1e9
+    best_end = search_end
+    a0 = ref - ref.mean()
+    a_norm = float(np.sqrt((a0 * a0).sum()) + 1e-12)
+
+    for end_pos in range(search_start, search_end, step):
+        cand = audio[end_pos - window:end_pos]
+        if len(cand) < window:
+            continue
+        cand_rms = float(np.sqrt(np.mean(cand * cand) + 1e-12))
+        b = cand - cand.mean()
+        b_norm = float(np.sqrt((b * b).sum()) + 1e-12)
+        corr = float((a0 * b).sum() / (a_norm * b_norm))
+        rms_match = 1.0 - abs(cand_rms - ref_rms) / (ref_rms + cand_rms + 1e-6)
+        cand_cent = centroid(cand)
+        cent_match = 1.0 - abs(cand_cent - ref_cent) / (ref_cent + cand_cent + 1e-6)
+        score = 0.5 * corr + 0.25 * rms_match + 0.25 * cent_match
+        if score > best_score:
+            best_score = score
+            best_end = end_pos
+
+    return best_end / sr, float(best_score)
+
+
 def render_loop(job_id, input_path, duration_hours, title_hint=""):
     def update(status=None, progress=None, error=None, output=None):
         with JOBS_LOCK:
@@ -151,7 +204,27 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
         if src_dur < 20:
             raise RuntimeError(f"Audio demasiado corto ({src_dur:.1f}s). Necesita al menos 20 segundos.")
 
-        trim_end = max(src_dur - 0.5, min(src_dur, 5.0))
+        # Auto-detect best loop endpoint
+        update(status="Finding natural loop point", progress=10)
+        default_end = max(src_dur - 0.5, min(src_dur, 5.0))
+        loop_score = None
+        try:
+            best_end, score = find_best_loop_point(
+                raw_wav, window_sec=2.0,
+                search_back_sec=min(6.0, max(2.0, src_dur / 3))
+            )
+            if score > 0.3 and best_end > 20.0 and best_end <= src_dur - 0.05:
+                trim_end = best_end
+                loop_score = score
+                print(f"[render] job={job_id} auto-loop: end={trim_end:.2f}s score={score:.3f}", flush=True)
+            else:
+                trim_end = default_end
+                loop_score = score
+                print(f"[render] job={job_id} auto-loop fallback score={score:.3f}", flush=True)
+        except Exception as e:
+            print(f"[render] job={job_id} auto-loop failed ({e})", flush=True)
+            trim_end = default_end
+
         clean_wav = work_dir / "clean.wav"
         subprocess.run([
             "ffmpeg", "-y", "-i", str(raw_wav),
@@ -161,8 +234,7 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
         raw_wav.unlink(missing_ok=True)
         clean_dur = trim_end - 0.5
 
-        # Step 2: build unit (8 copies chained with qsin 8s crossfade)
-        update(status="Building loop unit", progress=15)
+        update(status="Building loop unit", progress=20)
         XFADE = 8.0
         unit_wav = work_dir / "unit.wav"
         filter_complex = "[0]asplit=8[a1][a2][a3][a4][a5][a6][a7][a8];"
@@ -179,7 +251,7 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
         unit_dur = probe_duration(unit_wav)
         print(f"[render] job={job_id} unit_dur={unit_dur:.2f}s", flush=True)
 
-        # Step 2b: SEAL wrap-around so end→start is a crossfade (no hard cut between units)
+        # Seal wrap-around so end->start is a crossfade
         update(status="Sealing unit for seamless loop", progress=30)
         WRAP = 8.0
         seal_wav = work_dir / "seal.wav"
@@ -199,7 +271,7 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
         seal_dur = probe_duration(seal_wav)
         print(f"[render] job={job_id} seal_dur={seal_dur:.2f}s", flush=True)
 
-        # Step 3: loop + master + MP3 in one shot
+        # Loop + master + MP3 in one shot
         update(status=f"Rendering {duration_hours}h MP3", progress=40)
         target_sec = int(duration_hours * 3600)
         fade_in_dur = 10
@@ -226,7 +298,6 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
         if out_dur < target_sec * 0.95:
             raise RuntimeError(f"output is only {out_dur:.0f}s, expected {target_sec}s")
 
-        # Cut report: after sealing, there are no hard cuts, only smooth crossfades
         def fmt(sec):
             sec = max(0.0, sec)
             h = int(sec // 3600)
@@ -235,16 +306,13 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
             if h > 0: return f"{h}:{m:02d}:{s:05.2f}"
             return f"{m}:{s:05.2f}"
 
-        # Internal crossfades within the original unit (7 per unit, at midpoints)
         internal_cuts = []
         for k in range(1, 8):
             t = k * (clean_dur - XFADE) + (k - 1) * XFADE + XFADE / 2
-            # after sealing, body starts at WRAP, so shift by -WRAP
             internal_cuts.append(t - WRAP)
 
-        # Wrap-around seal crossfade: happens at end of each sealed-unit = seal_dur boundary
         wrap_cuts = []
-        t = seal_dur - WRAP / 2  # midpoint of wrap crossfade
+        t = seal_dur - WRAP / 2
         while t < target_sec - 1:
             wrap_cuts.append(t)
             t += seal_dur
@@ -262,19 +330,20 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
         cuts_lines = [
             f"Sleep Loop - cut report",
             f"Source duration: {src_dur:.2f}s",
-            f"Clean duration: {clean_dur:.2f}s",
+            f"Auto-loop score: {loop_score:.3f}" if loop_score is not None else "Auto-loop: disabled",
+            f"Clean duration (trimmed at best loop point): {clean_dur:.2f}s",
             f"Sealed unit duration: {seal_dur:.2f}s ({fmt(seal_dur)})",
             f"Target: {duration_hours}h ({target_sec}s)",
             f"Fade in: {fade_in_dur}s / Fade out: {fade_out_dur}s",
             f"",
-            f"HARD CUTS: none (unit is self-sealed with wrap crossfade)",
+            f"HARD CUTS: none (source trimmed at best loop point + unit wrap-sealed)",
             f"",
-            f"WRAP crossfades (between sealed units, qsin 8s) - {len(wrap_cuts)} total:",
+            f"WRAP crossfades between sealed units (qsin 8s) - {len(wrap_cuts)} total:",
         ]
         for i, c in enumerate(wrap_cuts, 1):
             cuts_lines.append(f"  {i}. {fmt(c)}  ({c:.2f}s)")
         cuts_lines.append("")
-        cuts_lines.append(f"INTERNAL crossfades (inside unit, qsin 8s) - {len(all_internal)} total:")
+        cuts_lines.append(f"INTERNAL crossfades inside unit (qsin 8s) - {len(all_internal)} total:")
         for i, c in enumerate(all_internal, 1):
             cuts_lines.append(f"  {i}. {fmt(c)}  ({c:.2f}s)")
         cuts_txt = work_dir / "cuts.txt"
@@ -282,8 +351,9 @@ def render_loop(job_id, input_path, duration_hours, title_hint=""):
 
         with JOBS_LOCK:
             JOBS[job_id]["cuts_file"] = str(cuts_txt)
-            JOBS[job_id]["hard_cuts"] = [fmt(c) for c in wrap_cuts]  # surface wrap cuts as "check these first"
+            JOBS[job_id]["hard_cuts"] = [fmt(c) for c in wrap_cuts]
             JOBS[job_id]["smooth_cuts_count"] = len(all_internal)
+            JOBS[job_id]["loop_score"] = loop_score
 
         clean_wav.unlink(missing_ok=True)
         unit_wav.unlink(missing_ok=True)
@@ -346,6 +416,7 @@ def api_status(job_id):
             "hard_cuts": job.get("hard_cuts", []),
             "smooth_cuts_count": job.get("smooth_cuts_count", 0),
             "has_cuts_file": bool(job.get("cuts_file")),
+            "loop_score": job.get("loop_score"),
         })
 
 @app.route("/download/<job_id>")
