@@ -1,14 +1,5 @@
 """
 Sleep Loop Web - Flask app
-Features:
-  - Trending sleep sounds (Google Trends + YouTube)
-  - Upload 1 or many audios
-  - Separate mode: each audio -> its own loop
-  - Mix mode: all audios mixed into one loop (rain + thunder + wind)
-  - Custom duration in minutes (10 to 720)
-  - Seamless render: 16-copy unit, qsin 8s internal crossfades, 20s wrap-around seal
-  - Auto loop-point detection (RMS + waveform + spectral centroid)
-  - Cuts report (.txt) with INTERNAL + WRAP timestamps
 """
 import os
 import uuid
@@ -27,19 +18,15 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 RENDER_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 1000 * 1024 * 1024  # 1 GB (for multi-upload)
+app.config["MAX_CONTENT_LENGTH"] = 1000 * 1024 * 1024
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-# Render constants
-INTERNAL_XFADE = 8.0      # inside the unit (do NOT change — user-approved)
-WRAP_XFADE = 20.0         # wrap-around seal between units (was 8s, now 20s)
-UNIT_COPIES = 16          # how many source copies make up one unit (was 8, now 16)
+INTERNAL_XFADE = 8.0
+WRAP_XFADE = 20.0
+UNIT_COPIES = 16
 
-# -----------------------------------------------------------------------------
-# Trending: Google Trends + YouTube search
-# -----------------------------------------------------------------------------
 TRENDING_CACHE = {"date": None, "items": []}
 
 FALLBACK_TOPICS = [
@@ -122,9 +109,6 @@ def get_trending():
     return items
 
 
-# -----------------------------------------------------------------------------
-# Audio helpers
-# -----------------------------------------------------------------------------
 def probe_duration(path: Path) -> float:
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
@@ -202,11 +186,7 @@ def fmt_t(sec):
     return f"{m}:{s:05.2f}"
 
 
-# -----------------------------------------------------------------------------
-# Core render pipeline
-# -----------------------------------------------------------------------------
 def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mix_mode: bool):
-    """Render one loop. `input_paths` is list[Path] (len 1 normal, len>1 if mix_mode)."""
     def update(status=None, progress=None, error=None, output=None):
         with JOBS_LOCK:
             if status is not None: JOBS[job_id]["status"] = status
@@ -216,11 +196,9 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
 
     work_dir = RENDER_DIR / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
-    duration_hours = duration_min / 60.0
     target_sec = duration_min * 60
 
     try:
-        # Step 1: decode to raw WAV (if mix_mode, amix N sources)
         update(status="Decoding source", progress=5)
         raw_wav = work_dir / "raw.wav"
         if mix_mode and len(input_paths) > 1:
@@ -228,7 +206,6 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
             for p in input_paths:
                 inputs += ["-i", str(p)]
             n = len(input_paths)
-            # amix with normalize=0 + custom weights, then scale to avoid clipping
             filter_mix = f"amix=inputs={n}:duration=longest:normalize=0:weights='{' '.join(['1']*n)}',dynaudnorm=f=500:g=15"
             subprocess.run([
                 "ffmpeg", "-y", *inputs,
@@ -248,13 +225,11 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         if src_dur < 20:
             raise RuntimeError(f"Audio demasiado corto ({src_dur:.1f}s). Necesita al menos 20 segundos.")
 
-        # Step 2: find best loop point
         update(status="Finding natural loop point", progress=10)
         default_end = max(src_dur - 0.5, min(src_dur, 5.0))
         try:
             best_end, score = find_best_loop_point(
-                raw_wav,
-                window_sec=2.0,
+                raw_wav, window_sec=2.0,
                 search_back_sec=min(6.0, max(2.0, src_dur / 3))
             )
             if score > 0.3 and best_end > 20.0 and best_end <= src_dur - 0.05:
@@ -276,7 +251,6 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         raw_wav.unlink(missing_ok=True)
         clean_dur = trim_end - 0.5
 
-        # Step 3: build N-copy unit with INTERNAL qsin 8s crossfades
         update(status=f"Building unit ({UNIT_COPIES} copies)", progress=20)
         unit_dur = UNIT_COPIES * clean_dur - (UNIT_COPIES - 1) * INTERNAL_XFADE
         unit_wav = work_dir / "unit.wav"
@@ -294,19 +268,14 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         actual_unit_dur = probe_duration(unit_wav)
         print(f"[render] unit_dur={actual_unit_dur:.2f}s", flush=True)
 
-        # Step 4: seal the unit (wrap-around crossfade 20s, qsin)
-        # sealed[0..L-WRAP] = unit[WRAP..L]   (body)
-        # sealed[L-WRAP..L] = acrossfade(unit[L-WRAP..L], unit[0..WRAP]) (seam)
-        # -> iteration boundary is unit[WRAP] -> unit[WRAP] => seamless
+        # TRUE seamless wrap-around seal via acrossfade
         update(status="Sealing wrap (20s crossfade)", progress=35)
         sealed_wav = work_dir / "sealed.wav"
         seal_fc = (
-            f"[0:a]asplit=3[u1][u2][u3];"
-            f"[u1]atrim=start={WRAP_XFADE}:end={actual_unit_dur},asetpts=PTS-STARTPTS[body];"
-            f"[u2]atrim=start=0:end={WRAP_XFADE},asetpts=PTS-STARTPTS[head];"
-            f"[u3]atrim=start={actual_unit_dur - WRAP_XFADE}:end={actual_unit_dur},asetpts=PTS-STARTPTS[tail];"
-            f"[tail][head]acrossfade=d={WRAP_XFADE}:c1=qsin:c2=qsin[seam];"
-            f"[body][seam]concat=n=2:v=0:a=1[out]"
+            f"[0:a]asplit=2[a1][a2];"
+            f"[a1]atrim=start={WRAP_XFADE},asetpts=PTS-STARTPTS[first];"
+            f"[a2]atrim=end={WRAP_XFADE},asetpts=PTS-STARTPTS[second];"
+            f"[first][second]acrossfade=d={WRAP_XFADE}:c1=qsin:c2=qsin[out]"
         )
         subprocess.run([
             "ffmpeg", "-y", "-i", str(unit_wav),
@@ -317,7 +286,6 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         sealed_dur = probe_duration(sealed_wav)
         print(f"[render] sealed_dur={sealed_dur:.2f}s", flush=True)
 
-        # Step 5: stream_loop + loudnorm + 10s fades + MP3 encode
         update(status=f"Rendering {duration_min} min MP3", progress=50)
         fade_out_start = target_sec - 10
         out_mp3 = work_dir / "output.mp3"
@@ -341,16 +309,12 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         if out_dur < target_sec * 0.95:
             raise RuntimeError(f"output is only {out_dur:.0f}s, expected {target_sec}s")
 
-        # Step 6: build cuts report
         internal_cuts_in_unit = []
         for k in range(1, UNIT_COPIES):
             t = k * (clean_dur - INTERNAL_XFADE) + (k - 1) * INTERNAL_XFADE
             internal_cuts_in_unit.append(t + INTERNAL_XFADE / 2)
 
-        # seal shifts everything by -WRAP_XFADE (body starts at original unit[WRAP])
-        # sealed_internal_k = internal_cuts_in_unit[k] - WRAP_XFADE  (if positive, inside sealed)
         sealed_internals = [c - WRAP_XFADE for c in internal_cuts_in_unit if c - WRAP_XFADE > 0]
-        # WRAP crossfade midpoint inside each sealed unit is at sealed_dur - WRAP_XFADE/2
         wrap_midpoint = sealed_dur - WRAP_XFADE / 2
 
         all_internals = []
@@ -363,7 +327,6 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
                 if p < target_sec:
                     all_internals.append(p)
             wp = base + wrap_midpoint
-            # only a real wrap if there's ANOTHER unit starting after this wrap
             if wp < target_sec - 1 and (unit_idx + 1) * sealed_dur < target_sec:
                 all_wraps.append(wp)
             unit_idx += 1
@@ -407,9 +370,6 @@ def render_loop(job_id: str, input_paths, duration_min: int, title_hint: str, mi
         update(status="Failed", error=str(e))
 
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -427,7 +387,6 @@ def api_render():
         return jsonify({"error": "No audio files"}), 400
     files = [f for f in files if f.filename]
 
-    # duration in minutes (int)
     duration_raw = request.form.get("duration_min", "60")
     try:
         duration_min = int(float(duration_raw))
@@ -436,7 +395,7 @@ def api_render():
     except ValueError:
         return jsonify({"error": "Invalid duration"}), 400
 
-    mode = request.form.get("mode", "separate")  # "separate" or "mix"
+    mode = request.form.get("mode", "separate")
     title = request.form.get("title", "")[:60]
 
     saved_paths = []
@@ -450,7 +409,6 @@ def api_render():
     job_ids = []
 
     if mode == "mix" and len(saved_paths) > 1:
-        # single job that mixes all sources
         job_id = uuid.uuid4().hex[:12]
         with JOBS_LOCK:
             JOBS[job_id] = {
@@ -466,7 +424,6 @@ def api_render():
         t.start()
         job_ids.append({"job_id": job_id, "label": f"Mix of {len(saved_paths)} audios"})
     else:
-        # separate: one job per file
         for idx, p in enumerate(saved_paths):
             job_id = uuid.uuid4().hex[:12]
             base_name = Path(files[idx].filename).stem[:40]
