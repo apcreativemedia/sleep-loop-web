@@ -171,6 +171,62 @@
   </div>
 
 <script>
+// ---- Notification sound when render finishes ----
+function playDoneChime() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+    // Three-note chime: C5, E5, G5
+    const notes = [523.25, 659.25, 783.99];
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const start = now + i * 0.18;
+      const end = start + 0.6;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.25, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, end);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(start);
+      osc.stop(end + 0.05);
+    });
+    // Repeat once after 1.5s so it's easy to catch
+    setTimeout(() => {
+      const ctx2 = new (window.AudioContext || window.webkitAudioContext)();
+      const t0 = ctx2.currentTime;
+      notes.forEach((freq, i) => {
+        const osc = ctx2.createOscillator();
+        const gain = ctx2.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const start = t0 + i * 0.18;
+        const end = start + 0.6;
+        gain.gain.setValueAtTime(0, start);
+        gain.gain.linearRampToValueAtTime(0.25, start + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.001, end);
+        osc.connect(gain).connect(ctx2.destination);
+        osc.start(start);
+        osc.stop(end + 0.05);
+      });
+    }, 1500);
+  } catch (e) {
+    console.warn("audio chime failed", e);
+  }
+}
+
+function flashTitle() {
+  const original = document.title;
+  let toggle = false;
+  const interval = setInterval(() => {
+    document.title = toggle ? original : "🎉 ¡Loop listo!";
+    toggle = !toggle;
+  }, 800);
+  const stop = () => { clearInterval(interval); document.title = original; window.removeEventListener("focus", stop); };
+  window.addEventListener("focus", stop);
+}
+
 async function loadTrending() {
   try {
     const r = await fetch("/api/trending");
@@ -206,6 +262,13 @@ document.getElementById("form").addEventListener("submit", async (e) => {
   dl.innerHTML = "";
   bar.style.width = "0%";
   statusText.textContent = "Subiendo…";
+
+  // Prime audio context on user gesture so the chime can play later
+  try {
+    const primer = new (window.AudioContext || window.webkitAudioContext)();
+    if (primer.state === "suspended") await primer.resume();
+    primer.close();
+  } catch (e) {}
 
   const fd = new FormData(form);
   try {
@@ -243,6 +306,8 @@ async function pollStatus(jobId) {
       }
       if (data.done) {
         statusText.textContent = "¡Listo! 🎉";
+        playDoneChime();
+        flashTitle();
         let cutsHtml = "";
         if (data.hard_cuts && data.hard_cuts.length) {
           cutsHtml = `<div style="margin-top:1rem;padding:.9rem;background:#0d1430;border:1px solid var(--border);border-radius:9px;font-size:.9rem">
