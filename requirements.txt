@@ -2,3 +2,5 @@ Flask==3.0.3
 pytrends==4.9.2
 yt-dlp==2024.8.6
 gunicorn==22.0.0
+numpy==1.26.4
+scipy==1.13.1
