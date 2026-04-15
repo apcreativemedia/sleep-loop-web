@@ -243,7 +243,20 @@ async function pollStatus(jobId) {
       }
       if (data.done) {
         statusText.textContent = "¡Listo! 🎉";
-        dl.innerHTML = `<a class="download-btn" href="/download/${jobId}">⬇ Descargar MP3</a>`;
+        let cutsHtml = "";
+        if (data.hard_cuts && data.hard_cuts.length) {
+          cutsHtml = `<div style="margin-top:1rem;padding:.9rem;background:#0d1430;border:1px solid var(--border);border-radius:9px;font-size:.9rem">
+            <strong>⚠️ Cortes duros entre units</strong> (escuchá acá si se sienten):<br>
+            <span style="color:var(--accent2);font-family:monospace">${data.hard_cuts.join(" · ")}</span>
+            <br><small style="color:var(--muted)">+ ${data.smooth_cuts_count} crossfades suaves (qsin 8s, deberían ser inaudibles)</small>
+          </div>`;
+        } else {
+          cutsHtml = `<div style="margin-top:1rem;padding:.7rem;background:#0d1430;border:1px solid var(--border);border-radius:9px;font-size:.9rem;color:var(--muted)">Sin cortes duros — cabe en un solo unit. ${data.smooth_cuts_count} crossfades suaves.</div>`;
+        }
+        dl.innerHTML = `
+          <a class="download-btn" href="/download/${jobId}">⬇ Descargar MP3</a>
+          <a class="download-btn" style="background:var(--border);color:var(--fg)" href="/cuts/${jobId}">📄 Descargar lista de cortes (.txt)</a>
+          ${cutsHtml}`;
         btn.disabled = false;
         return;
       }
