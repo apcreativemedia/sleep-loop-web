@@ -255,6 +255,66 @@ def render_loop(job_id: str, input_path: Path, duration_hours: float, title_hint
         if out_dur < target_sec * 0.95:
             raise RuntimeError(f"output is only {out_dur:.0f}s, expected {target_sec}s")
 
+        # Compute cut points (smooth + hard) and write a .txt next to the MP3
+        def fmt(sec):
+            sec = max(0.0, sec)
+            h = int(sec // 3600)
+            m = int((sec % 3600) // 60)
+            s = sec - (h * 3600 + m * 60)
+            if h > 0:
+                return f"{h}:{m:02d}:{s:05.2f}"
+            return f"{m}:{s:05.2f}"
+
+        smooth_cuts = []  # inside the unit (qsin 8s crossfades)
+        # inside the FIRST unit, crossfades start at these times:
+        for k in range(1, 8):
+            t = k * (clean_dur - XFADE) + (k - 1) * XFADE
+            # crossfade spans from t to t+XFADE; midpoint is t+XFADE/2
+            smooth_cuts.append(t + XFADE / 2)
+
+        hard_cuts = []  # between units (no crossfade)
+        t = unit_dur
+        while t < target_sec - 1:
+            hard_cuts.append(t)
+            t += unit_dur
+
+        # All-cuts across the full duration (smooth+hard, repeating per unit)
+        all_smooth = []
+        unit_idx = 0
+        while unit_idx * unit_dur < target_sec:
+            base = unit_idx * unit_dur
+            for sc in smooth_cuts:
+                p = base + sc
+                if p < target_sec:
+                    all_smooth.append(p)
+            unit_idx += 1
+
+        cuts_lines = [
+            f"Sleep Loop - cut report",
+            f"Source duration: {src_dur:.2f}s ({fmt(src_dur)})",
+            f"Clean duration (trimmed): {clean_dur:.2f}s",
+            f"Unit duration (8 copies + qsin 8s crossfades): {unit_dur:.2f}s ({fmt(unit_dur)})",
+            f"Target: {duration_hours}h ({target_sec}s)",
+            f"",
+            f"HARD CUTS between units (listen here first — potential seams):",
+        ]
+        if hard_cuts:
+            for i, c in enumerate(hard_cuts, 1):
+                cuts_lines.append(f"  {i}. {fmt(c)}  ({c:.2f}s)")
+        else:
+            cuts_lines.append("  (none — target fits inside one unit)")
+        cuts_lines.append("")
+        cuts_lines.append(f"SMOOTH crossfades (qsin 8s, should be inaudible) — {len(all_smooth)} total:")
+        for i, c in enumerate(all_smooth, 1):
+            cuts_lines.append(f"  {i}. {fmt(c)}  ({c:.2f}s)")
+        cuts_txt = work_dir / "cuts.txt"
+        cuts_txt.write_text("\n".join(cuts_lines))
+
+        with JOBS_LOCK:
+            JOBS[job_id]["cuts_file"] = str(cuts_txt)
+            JOBS[job_id]["hard_cuts"] = [fmt(c) for c in hard_cuts]
+            JOBS[job_id]["smooth_cuts_count"] = len(all_smooth)
+
         # Cleanup intermediate WAVs to save disk
         clean_wav.unlink(missing_ok=True)
         unit_wav.unlink(missing_ok=True)
@@ -332,6 +392,9 @@ def api_status(job_id):
             "progress": job["progress"],
             "error": job["error"],
             "done": job["output"] is not None,
+            "hard_cuts": job.get("hard_cuts", []),
+            "smooth_cuts_count": job.get("smooth_cuts_count", 0),
+            "has_cuts_file": bool(job.get("cuts_file")),
         })
 
 
@@ -344,6 +407,17 @@ def download(job_id):
     title = (job.get("title") or "sleep-loop").replace(" ", "-")
     dl_name = f"{title}-{int(job['duration_h'])}h.mp3"
     return send_file(job["output"], as_attachment=True, download_name=dl_name, mimetype="audio/mpeg")
+
+
+@app.route("/cuts/<job_id>")
+def download_cuts(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if not job or not job.get("cuts_file"):
+        abort(404)
+    title = (job.get("title") or "sleep-loop").replace(" ", "-")
+    dl_name = f"{title}-{int(job['duration_h'])}h-cuts.txt"
+    return send_file(job["cuts_file"], as_attachment=True, download_name=dl_name, mimetype="text/plain")
 
 
 @app.route("/health")
